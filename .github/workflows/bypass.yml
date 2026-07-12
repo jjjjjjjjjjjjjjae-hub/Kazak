@@ -1,0 +1,109 @@
+name: Precision APK Patching Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'zulu'
+        java-version: '17'
+
+    - name: Configure Android Tools Paths
+      id: android-tools
+      run: |
+        BUILD_TOOLS_VERSION=$(ls -1 "$ANDROID_HOME/build-tools" | sort -V | tail -n 1)
+        echo "ZIPALIGN=$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION/zipalign" >> $GITHUB_ENV
+        echo "APKSIGNER=$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION/apksigner" >> $GITHUB_ENV
+
+    - name: Download Apktool
+      run: |
+        wget https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar -O apktool.jar
+
+    - name: Decompile APK
+      run: |
+        if [ ! -f "base.apk" ]; then
+          echo "Қате: Репозиторийдің түбінде base.apk табылмады!"
+          exit 1
+        fi
+        java -jar apktool.jar d base.apk -o decompiled_apk
+
+    - name: Inject Return True to Target Logic
+      run: |
+        cat << 'PYEOF' > precise_injector.py
+        import os
+        import sys
+
+        # ==========================================================
+        # ОСЫ ЖЕРГЕ JADX-ТАН ТАБЫЛҒАН НАҚТЫ СЫНЫП ПЕН ФУНКЦИЯНЫ ЖАЗАСЫЗ
+        # Мысалы, төмендегі шаблон жалпылама іздеуді де қамтиды:
+        # ==========================================================
+        TARGET_FILE = 'decompiled_apk/smali/com/example/app/LoginActivity.smali'
+        TARGET_METHOD = '.method public checkPassword'
+        # ==========================================================
+
+        # Егер көрсетілген файл болмаса, автоматты түрде қорғалмаған кілт сөздерді іздейді
+        if not os.path.exists(TARGET_FILE):
+            found = False
+            for root, dirs, files in os.walk('decompiled_apk'):
+                for file in files:
+                    if file.endswith('.smali') and any(k in file.lower() for k in ['login', 'auth', 'pass', 'verify']):
+                        TARGET_FILE = os.path.join(root, file)
+                        found = True
+                        break
+                if found: break
+
+        if os.path.exists(TARGET_FILE):
+            with open(TARGET_FILE, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()
+
+            new_lines = []
+            inside_method = False
+            for line in lines:
+                new_lines.append(line)
+                if TARGET_METHOD in line or ('.method' in line and 'Z' in line and found):
+                    inside_method = True
+                    continue
+                if inside_method and ('.registers' in line or '.locals' in line):
+                    new_lines.append("\n    # Мәжбүрлі түрде айналып өту коды енгізілді\n")
+                    new_lines.append("    const/4 v0, 0x1\n")
+                    new_lines.append("    return v0\n")
+                    inside_method = False
+            
+            with open(TARGET_FILE, 'w', encoding='utf-8') as f:
+                f.writelines(new_lines)
+            print(f"[Сәтті] Нақты патч мына файлға енгізілді: {TARGET_FILE}")
+        else:
+            print("Қате: Патчталатын файл табылмады.")
+        PYEOF
+        python3 precise_injector.py
+
+    - name: Recompile APK
+      run: |
+        java -jar apktool.jar b decompiled_apk -o unaligned.apk
+
+    - name: Align APK
+      run: |
+        $ZIPALIGN -v 4 unaligned.apk final_aligned.apk
+
+    - name: Sign APK (v2/v3 Scheme)
+      run: |
+        keytool -genkey -v -keystore release.jks -keyalg RSA -keysize 2048 -validity 10000 -alias mykey -storepass mypassword -keypass mypassword -dname "CN=Android, O=Bypass, C=KZ"
+        $APKSIGNER sign --ks release.jks --ks-pass pass:mypassword --out final_patched.apk final_aligned.apk
+
+    - name: Upload Patched APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: Patched-APK-Result
+        path: final_patched.apk
